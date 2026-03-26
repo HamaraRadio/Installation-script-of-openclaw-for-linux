@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  OpenClaw Installer — Proxmox Ubuntu 24.04 LXC Container
+#  https://docs.openclaw.ai
+# =============================================================================
+#  Usage:
+#    chmod +x install_openclaw.sh
+#    ./install_openclaw.sh
+#
+#  What this script does:
+#    1. Updates system packages
+#    2. Installs Node.js 22 (via NodeSource)
+#    3. Installs build-essential tools
+#    4. Installs OpenClaw globally via npm
+#    5. Creates a dedicated system user (openclaw)
+#    6. Creates a systemd service for auto-start
+#    7. Opens port 18789 via ufw (if active)
+# =============================================================================
+
+set -euo pipefail
+
+# ── Colours ──────────────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+RESET='\033[0m'
+
+log()    { echo -e "${CYAN}[INFO]${RESET}  $*"; }
+ok()     { echo -e "${GREEN}[OK]${RESET}    $*"; }
+warn()   { echo -e "${YELLOW}[WARN]${RESET}  $*"; }
+error()  { echo -e "${RED}[ERROR]${RESET} $*" >&2; exit 1; }
+
+# ── Root check ────────────────────────────────────────────────────────────────
+if [[ "$EUID" -ne 0 ]]; then
+  error "Please run this script as root (or via sudo)."
+fi
+
+# ── Banner ────────────────────────────────────────────────────────────────────
+echo
+echo -e "${BOLD}${CYAN}"
+echo "  ╔═══════════════════════════════════════════════════╗"
+echo "  ║   🦞  OpenClaw Installer for Proxmox Ubuntu 24.04  ║"
+echo "  ╚═══════════════════════════════════════════════════╝"
+echo -e "${RESET}"
+echo -e "  Target: ${BOLD}Ubuntu 24.04 LXC container${RESET}"
+echo -e "  Gateway port: ${BOLD}18789${RESET}"
+echo
+
+# ── Step 1: System Update ─────────────────────────────────────────────────────
+log "Step 1/6 — Updating system packages..."
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get upgrade -y -qq
+apt-get install -y -qq \
+  curl \
+  ca-certificates \
+  gnupg \
+  git \
+  build-essential \
+  ufw \
+  lsof
+ok "System packages updated."
+
+# ── Step 2: Install Node.js 22 ────────────────────────────────────────────────
+log "Step 2/6 — Installing Node.js 22 via NodeSource..."
+
+NODE_MAJOR=22
+if command -v node &>/dev/null; then
+  CURRENT_NODE=$(node -v | grep -oP '(?<=v)\d+')
+  if [[ "$CURRENT_NODE" -ge "$NODE_MAJOR" ]]; then
+    ok "Node.js $(node -v) already installed — skipping."
+  else
+    warn "Node.js $(node -v) found but version < $NODE_MAJOR. Upgrading..."
+    curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - >/dev/null
+    apt-get install -y -qq nodejs
+    ok "Node.js upgraded to $(node -v)."
+  fi
+else
+  curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - >/dev/null
+  apt-get install -y -qq nodejs
+  ok "Node.js $(node -v) installed."
+fi
+
+# Verify npm
+if ! command -v npm &>/dev/null; then
+  error "npm not found after Node.js install. Aborting."
+fi
+ok "npm $(npm -v) ready."
+
+# ── Step 3: Install OpenClaw ──────────────────────────────────────────────────
+log "Step 3/6 — Installing OpenClaw globally via npm..."
+npm install -g openclaw@latest --loglevel=error
+ok "OpenClaw $(openclaw --version 2>/dev/null || echo 'installed') installed."
+
+# ── Step 4: Create dedicated service user ────────────────────────────────────
+log "Step 4/6 — Creating 'openclaw' system user..."
+if id -u openclaw &>/dev/null; then
+  warn "User 'openclaw' already exists — skipping creation."
+else
+  useradd --system --create-home --shell /bin/bash openclaw
+  ok "User 'openclaw' created."
+fi
+
+OPENCLAW_HOME="$(getent passwd openclaw | cut -d: -f6)"
+OPENCLAW_BIN="$(npm root -g)/../bin/openclaw"
+
+# ── Step 5: Create systemd service ───────────────────────────────────────────
+log "Step 5/6 — Creating systemd service..."
+
+# Detect Node binary path for ExecStart
+NODE_BIN="$(command -v node)"
+OPENCLAW_GLOBAL_BIN="$(npm bin -g)/openclaw"
+
+cat > /etc/systemd/system/openclaw.service <<EOF
+[Unit]
+Description=OpenClaw AI Gateway
+Documentation=https://docs.openclaw.ai
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=openclaw
+WorkingDirectory=${OPENCLAW_HOME}
+ExecStart=${OPENCLAW_GLOBAL_BIN} gateway
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=openclaw
+
+# Resource limits — tune for your container
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable openclaw.service
+ok "Systemd service 'openclaw' created and enabled."
+
+# ── Step 6: Firewall (UFW) ────────────────────────────────────────────────────
+log "Step 6/6 — Configuring firewall..."
+if ufw status | grep -q "Status: active"; then
+  ufw allow 18789/tcp comment 'OpenClaw Gateway' >/dev/null
+  ok "UFW rule added for port 18789."
+else
+  warn "UFW is not active — skipping firewall rule."
+  warn "If you use a firewall, manually allow TCP port 18789."
+fi
+
+# ── Post-install instructions ─────────────────────────────────────────────────
+CONTAINER_IP=$(hostname -I | awk '{print $1}')
+
+echo
+echo -e "${BOLD}${GREEN}════════════════════════════════════════════════════${RESET}"
+echo -e "${BOLD}${GREEN}  ✅  OpenClaw installed successfully!${RESET}"
+echo -e "${BOLD}${GREEN}════════════════════════════════════════════════════${RESET}"
+echo
+echo -e "${BOLD}Next steps:${RESET}"
+echo
+echo -e "  1. ${BOLD}Run onboarding${RESET} (interactive — do this as the openclaw user):"
+echo -e "     ${CYAN}su - openclaw -c 'openclaw onboard --install-daemon'${RESET}"
+echo
+echo -e "  2. ${BOLD}Or start the gateway directly:${RESET}"
+echo -e "     ${CYAN}systemctl start openclaw${RESET}"
+echo
+echo -e "  3. ${BOLD}Check service status:${RESET}"
+echo -e "     ${CYAN}systemctl status openclaw${RESET}"
+echo -e "     ${CYAN}journalctl -u openclaw -f${RESET}"
+echo
+echo -e "  4. ${BOLD}Run health check:${RESET}"
+echo -e "     ${CYAN}openclaw doctor${RESET}"
+echo
+echo -e "  5. ${BOLD}Access the dashboard${RESET} (from your local machine via SSH tunnel):"
+echo -e "     ${CYAN}ssh -N -L 18789:127.0.0.1:18789 root@${CONTAINER_IP}${RESET}"
+echo -e "     Then open: ${CYAN}http://localhost:18789${RESET}"
+echo
+echo -e "  6. ${BOLD}Get a tokenized dashboard URL (if token is required):${RESET}"
+echo -e "     ${CYAN}openclaw dashboard --no-open${RESET}"
+echo
+echo -e "${YELLOW}Note:${RESET} Proxmox LXC containers may not have full systemd support."
+echo -e "If ${CYAN}systemctl${RESET} fails, run OpenClaw directly:"
+echo -e "  ${CYAN}su - openclaw -c 'openclaw gateway'${RESET}"
+echo
